@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useRef } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import { QRCode } from 'react-qrcode-logo';
 import { motion, AnimatePresence } from 'framer-motion';
 import Papa from 'papaparse';
@@ -34,6 +34,49 @@ const GRID_ROWS = 3;
 const GRID_COLS = 3;
 const CELLS_PER_PAGE = GRID_ROWS * GRID_COLS;
 
+const STORAGE_KEY = 'cursor-qr-generator-results-v1';
+
+type ResultsViewMode = 'grid' | 'single';
+
+interface PersistedResultsState {
+  qrCodes: QRCodeData[];
+  selectedQrId: number;
+  resultsViewMode: ResultsViewMode;
+}
+
+function isQRCodeData(value: unknown): value is QRCodeData {
+  if (!value || typeof value !== 'object') return false;
+  const o = value as Record<string, unknown>;
+  return (
+    typeof o.id === 'number' &&
+    typeof o.url === 'string' &&
+    typeof o.isValid === 'boolean' &&
+    typeof o.hasWarning === 'boolean' &&
+    (o.warningMessage === undefined || typeof o.warningMessage === 'string')
+  );
+}
+
+function parsePersistedResults(raw: unknown): PersistedResultsState | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const o = raw as Record<string, unknown>;
+  if (!Array.isArray(o.qrCodes) || o.qrCodes.length === 0) return null;
+  if (!o.qrCodes.every(isQRCodeData)) return null;
+  if (o.resultsViewMode !== 'grid' && o.resultsViewMode !== 'single') return null;
+  const codes = o.qrCodes as QRCodeData[];
+  const ids = new Set(codes.map((q) => q.id));
+  let selectedQrId: number;
+  if (typeof o.selectedQrId === 'number' && ids.has(o.selectedQrId)) {
+    selectedQrId = o.selectedQrId;
+  } else {
+    selectedQrId = codes[0].id;
+  }
+  return {
+    qrCodes: codes,
+    selectedQrId,
+    resultsViewMode: o.resultsViewMode,
+  };
+}
+
 // Calculate the number for a specific cell position using cut-and-stack collation
 function numberForCell(p: number, r: number, c: number, R: number, C: number, N: number): number | null {
   const S = R * C;
@@ -46,12 +89,69 @@ function numberForCell(p: number, r: number, c: number, R: number, C: number, N:
 function QRCodeGeneratorContent() {
   const [links, setLinks] = useState<string>('');
   const [qrCodes, setQrCodes] = useState<QRCodeData[]>([]);
+  const [resultsViewMode, setResultsViewMode] = useState<ResultsViewMode>('grid');
+  const [selectedQrId, setSelectedQrId] = useState<number | null>(null);
+  const [hasRestored, setHasRestored] = useState(false);
   const [dragActive, setDragActive] = useState<boolean>(false);
   const [currentView, setCurrentView] = useState<'options' | 'upload' | 'manual'>('options');
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const printRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return;
+      const parsed = parsePersistedResults(JSON.parse(raw));
+      if (!parsed) return;
+      setQrCodes(parsed.qrCodes);
+      setSelectedQrId(parsed.selectedQrId);
+      setResultsViewMode(parsed.resultsViewMode);
+    } catch {
+      // ignore invalid storage
+    } finally {
+      setHasRestored(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (qrCodes.length === 0) {
+      if (selectedQrId !== null) setSelectedQrId(null);
+      return;
+    }
+    if (selectedQrId === null || !qrCodes.some((q) => q.id === selectedQrId)) {
+      setSelectedQrId(qrCodes[0].id);
+    }
+  }, [qrCodes, selectedQrId]);
+
+  useEffect(() => {
+    if (!hasRestored || typeof window === 'undefined') return;
+    if (qrCodes.length === 0) {
+      try {
+        localStorage.removeItem(STORAGE_KEY);
+      } catch {
+        // ignore
+      }
+      return;
+    }
+    try {
+      const payload: PersistedResultsState = {
+        qrCodes,
+        selectedQrId: selectedQrId ?? qrCodes[0].id,
+        resultsViewMode,
+      };
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+    } catch {
+      // ignore quota / private mode
+    }
+  }, [hasRestored, qrCodes, selectedQrId, resultsViewMode]);
+
+  useEffect(() => {
+    if (resultsViewMode !== 'single' || qrCodes.length === 0 || selectedQrId == null) return;
+    const el = document.getElementById(`qr-list-option-${selectedQrId}`);
+    el?.scrollIntoView({ block: 'nearest', behavior: 'auto' });
+  }, [selectedQrId, resultsViewMode, qrCodes.length]);
 
   // Toast management
   const showToast = (message: string, type: ToastType) => {
@@ -208,6 +308,7 @@ function QRCodeGeneratorContent() {
       });
 
       setQrCodes(qrCodeData);
+      setSelectedQrId(qrCodeData[0]?.id ?? null);
 
       // Show summary toast only for errors/warnings
       if (invalidCount > 0) {
@@ -237,11 +338,14 @@ function QRCodeGeneratorContent() {
   const clearAll = () => {
     setLinks('');
     setQrCodes([]);
-    // No toast needed - action is obvious
+    setSelectedQrId(null);
+    setResultsViewMode('grid');
   };
 
   const goBack = () => {
     setQrCodes([]);
+    setSelectedQrId(null);
+    setResultsViewMode('grid');
     setCurrentView('options');
     setLinks('');
   };
@@ -370,6 +474,7 @@ function QRCodeGeneratorContent() {
               });
 
               setQrCodes(qrCodeData);
+              setSelectedQrId(qrCodeData[0]?.id ?? null);
               setIsProcessing(false);
 
               // Show results only for errors/warnings
@@ -668,146 +773,323 @@ function QRCodeGeneratorContent() {
   );
 
   // QR Codes Results View
-  const renderResultsView = () => (
-    <motion.div 
-      className="min-h-screen" 
-      style={{ background: 'var(--background)' }}
-      initial={{ opacity: 0 }}
-      animate={{ opacity: 1 }}
-      exit={{ opacity: 0 }}
-      transition={{ duration: 0.3 }}
-    >
-      <div className="container mx-auto px-6 py-8 max-w-6xl">
-        <motion.button
-          onClick={goBack}
-          className="mb-6 text-sm"
-          style={{ color: 'var(--secondary-text)' }}
-          whileHover={{ x: -3, color: 'var(--accent-blue)' }}
-          transition={{ type: "spring", stiffness: 500, damping: 25 }}
-        >
-          ← Back
-        </motion.button>
-        
-        <motion.div 
-          className="flex justify-between items-center mb-4"
-          initial={{ y: 10, opacity: 0 }}
-          animate={{ y: 0, opacity: 1 }}
-          transition={{ duration: 0.2, delay: 0.05 }}
-        >
-          <h2 className="text-2xl font-semibold text-white">
-            QR Codes ({qrCodes.length})
-          </h2>
-          
-          <div className="flex gap-3">
-            <motion.button
-              onClick={handlePrint}
-              className="btn-secondary px-6 py-2 rounded-lg text-sm font-medium"
-              whileHover={{ scale: 1.03, y: -1 }}
-              whileTap={{ scale: 0.97 }}
-              transition={{ type: "spring", stiffness: 500, damping: 25 }}
-            >
-              Print
-            </motion.button>
-            <motion.button
-              onClick={clearAll}
-              className="btn-secondary px-6 py-2 rounded-lg text-sm font-medium"
-              whileHover={{ scale: 1.03, y: -1 }}
-              whileTap={{ scale: 0.97 }}
-              transition={{ type: "spring", stiffness: 500, damping: 25 }}
-            >
-              Clear
-            </motion.button>
+  const renderResultsView = () => {
+    const selectedQr =
+      qrCodes.find((q) => q.id === selectedQrId) ?? qrCodes[0] ?? null;
+
+    const shortUrlLabel = (url: string, maxLen: number) => {
+      const s = sanitizeUrlForDisplay(url);
+      return s.length > maxLen ? `${s.substring(0, maxLen)}…` : s;
+    };
+
+    const handleCodesListKeyDown = (e: React.KeyboardEvent<HTMLUListElement>) => {
+      if (
+        e.key !== 'ArrowDown' &&
+        e.key !== 'ArrowUp' &&
+        e.key !== 'Home' &&
+        e.key !== 'End'
+      ) {
+        return;
+      }
+      if (qrCodes.length === 0) return;
+      e.preventDefault();
+      const currentIndex = qrCodes.findIndex((q) => q.id === selectedQrId);
+      const safeIndex = currentIndex >= 0 ? currentIndex : 0;
+      if (e.key === 'ArrowDown' && safeIndex < qrCodes.length - 1) {
+        setSelectedQrId(qrCodes[safeIndex + 1].id);
+      } else if (e.key === 'ArrowUp' && safeIndex > 0) {
+        setSelectedQrId(qrCodes[safeIndex - 1].id);
+      } else if (e.key === 'Home') {
+        setSelectedQrId(qrCodes[0].id);
+      } else if (e.key === 'End') {
+        setSelectedQrId(qrCodes[qrCodes.length - 1].id);
+      }
+    };
+
+    const renderScreenQr = (qr: QRCodeData, size: number) => (
+      <>
+        {qr.hasWarning && (
+          <div
+            className="text-xs mb-2 px-2 py-1 rounded"
+            style={{
+              backgroundColor: 'rgba(245, 158, 11, 0.2)',
+              color: '#f59e0b',
+            }}
+          >
+            ⚠️ {qr.warningMessage}
           </div>
-        </motion.div>
-        
-        <motion.p 
-          className="text-xs mb-8 text-center px-4 py-2 rounded-lg"
-          style={{ color: 'var(--secondary-text)', backgroundColor: 'rgba(37, 99, 235, 0.1)', border: '1px solid rgba(37, 99, 235, 0.2)' }}
-          initial={{ y: 10, opacity: 0 }}
-          animate={{ y: 0, opacity: 1 }}
-          transition={{ duration: 0.2, delay: 0.1 }}
-        >
-          💡 Numbers are positioned for easy stacking: after printing, cut pages into squares and stack by position for perfect order
-        </motion.p>
-        
-        <motion.div 
-          className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6"
-          initial={{ y: 10, opacity: 0 }}
-          animate={{ y: 0, opacity: 1 }}
-          transition={{ duration: 0.2, delay: 0.1 }}
-        >
-          {qrCodes.map((qr, index) => (
-            <motion.div 
-              key={qr.id} 
-              className="qr-item rounded-lg p-4 text-center" 
-              style={{ 
-                background: 'var(--card-background)', 
-                border: qr.hasWarning ? '1px solid rgba(245, 158, 11, 0.5)' : '1px solid var(--border-color)'
-              }}
-              initial={{ opacity: 0, y: 10, scale: 0.95 }}
-              animate={{ opacity: 1, y: 0, scale: 1 }}
-              transition={{ 
-                duration: 0.15, 
-                delay: index * 0.02,
-                type: "spring",
-                stiffness: 500,
-                damping: 25
-              }}
-              whileHover={{ 
-                scale: 1.02, 
-                y: -2,
-                borderColor: qr.hasWarning ? 'rgba(245, 158, 11, 0.8)' : 'var(--accent-blue)',
-                boxShadow: '0 4px 12px rgba(37, 99, 235, 0.15)'
-              }}
-              whileTap={{ scale: 0.98 }}
-            >
-              <div className="text-sm mb-3 qr-card-text">
-                #{qr.id}
-              </div>
-              {qr.hasWarning && (
-                <div className="text-xs mb-2 px-2 py-1 rounded" style={{ 
-                  backgroundColor: 'rgba(245, 158, 11, 0.2)', 
-                  color: '#f59e0b'
-                }}>
-                  ⚠️ {qr.warningMessage}
-                </div>
-              )}
-              {qr.isValid ? (
-                <motion.div
-                  className="flex justify-center items-center mb-3"
-                  whileHover={{ scale: 1.03 }}
-                  transition={{ type: "spring", stiffness: 500, damping: 25 }}
+        )}
+        {qr.isValid ? (
+          <motion.div
+            className="flex justify-center items-center mb-3"
+            whileHover={{ scale: 1.03 }}
+            transition={{ type: 'spring', stiffness: 500, damping: 25 }}
+          >
+            <QRCode
+              value={qr.url}
+              size={size}
+              bgColor="var(--card-background)"
+              fgColor="white"
+              logoImage="/cursor-logo-bw.png"
+              logoWidth={Math.round(size * (32 / 120))}
+              logoOpacity={1}
+              logoPadding={0}
+              logoPaddingStyle="square"
+              removeQrCodeBehindLogo={true}
+              qrStyle="squares"
+            />
+          </motion.div>
+        ) : (
+          <div
+            className="mx-auto bg-red-900/20 border border-red-500/50 flex items-center justify-center rounded mb-3"
+            style={{ width: size, height: size }}
+          >
+            <span className="text-red-400 text-xs">Invalid URL</span>
+          </div>
+        )}
+      </>
+    );
+
+    return (
+      <motion.div
+        className="min-h-screen"
+        style={{ background: 'var(--background)' }}
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        exit={{ opacity: 0 }}
+        transition={{ duration: 0.3 }}
+      >
+        <div className="container mx-auto px-6 py-8 max-w-6xl">
+          <motion.button
+            onClick={goBack}
+            className="mb-6 text-sm"
+            style={{ color: 'var(--secondary-text)' }}
+            whileHover={{ x: -3, color: 'var(--accent-blue)' }}
+            transition={{ type: 'spring', stiffness: 500, damping: 25 }}
+          >
+            ← Back
+          </motion.button>
+
+          <motion.div
+            className="flex flex-col gap-4 sm:flex-row sm:justify-between sm:items-center mb-4"
+            initial={{ y: 10, opacity: 0 }}
+            animate={{ y: 0, opacity: 1 }}
+            transition={{ duration: 0.2, delay: 0.05 }}
+          >
+            <h2 className="text-2xl font-semibold text-white">
+              QR Codes ({qrCodes.length})
+            </h2>
+
+            <div className="flex flex-wrap items-center gap-3">
+              <div
+                className="flex rounded-lg overflow-hidden border"
+                style={{ borderColor: 'var(--border-color)' }}
+                role="group"
+                aria-label="Results view mode"
+              >
+                <button
+                  type="button"
+                  onClick={() => setResultsViewMode('grid')}
+                  className="px-4 py-2 text-sm font-medium transition-colors"
+                  style={{
+                    background:
+                      resultsViewMode === 'grid'
+                        ? 'var(--accent-blue)'
+                        : 'var(--card-background)',
+                    color: 'white',
+                  }}
                 >
-                  <QRCode 
-                    value={qr.url} 
-                    size={120}
-                    bgColor="var(--card-background)"
-                    fgColor="white"
-                    logoImage="/cursor-logo-bw.png"
-                    logoWidth={32}
-                    logoOpacity={1}
-                    logoPadding={0}
-                    logoPaddingStyle="square"
-                    removeQrCodeBehindLogo={true}
-                    qrStyle="squares"
-                  />
-                </motion.div>
-              ) : (
-                <div className="w-[120px] h-[120px] mx-auto bg-red-900/20 border border-red-500/50 flex items-center justify-center rounded mb-3">
-                  <span className="text-red-400 text-xs">Invalid URL</span>
-                </div>
-              )}
-              <div className="break-all qr-card-text qr-card-url">
-                {sanitizeUrlForDisplay(qr.url).length > 40 
-                  ? sanitizeUrlForDisplay(qr.url).substring(0, 40) + '...' 
-                  : sanitizeUrlForDisplay(qr.url)}
+                  Grid
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setResultsViewMode('single')}
+                  className="px-4 py-2 text-sm font-medium transition-colors border-l"
+                  style={{
+                    borderColor: 'var(--border-color)',
+                    background:
+                      resultsViewMode === 'single'
+                        ? 'var(--accent-blue)'
+                        : 'var(--card-background)',
+                    color: 'white',
+                  }}
+                >
+                  Single
+                </button>
               </div>
+              <motion.button
+                onClick={handlePrint}
+                className="btn-secondary px-6 py-2 rounded-lg text-sm font-medium"
+                whileHover={{ scale: 1.03, y: -1 }}
+                whileTap={{ scale: 0.97 }}
+                transition={{ type: 'spring', stiffness: 500, damping: 25 }}
+              >
+                Print
+              </motion.button>
+              <motion.button
+                onClick={clearAll}
+                className="btn-secondary px-6 py-2 rounded-lg text-sm font-medium"
+                whileHover={{ scale: 1.03, y: -1 }}
+                whileTap={{ scale: 0.97 }}
+                transition={{ type: 'spring', stiffness: 500, damping: 25 }}
+              >
+                Clear
+              </motion.button>
+            </div>
+          </motion.div>
+
+          <motion.p
+            className="text-xs mb-8 text-center px-4 py-2 rounded-lg"
+            style={{
+              color: 'var(--secondary-text)',
+              backgroundColor: 'rgba(37, 99, 235, 0.1)',
+              border: '1px solid rgba(37, 99, 235, 0.2)',
+            }}
+            initial={{ y: 10, opacity: 0 }}
+            animate={{ y: 0, opacity: 1 }}
+            transition={{ duration: 0.2, delay: 0.1 }}
+          >
+            💡 Numbers are positioned for easy stacking: after printing, cut pages
+            into squares and stack by position for perfect order
+          </motion.p>
+
+          {resultsViewMode === 'grid' ? (
+            <motion.div
+              className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6"
+              initial={{ y: 10, opacity: 0 }}
+              animate={{ y: 0, opacity: 1 }}
+              transition={{ duration: 0.2, delay: 0.1 }}
+            >
+              {qrCodes.map((qr, index) => (
+                <motion.div
+                  key={qr.id}
+                  className="qr-item rounded-lg p-4 text-center"
+                  style={{
+                    background: 'var(--card-background)',
+                    border: qr.hasWarning
+                      ? '1px solid rgba(245, 158, 11, 0.5)'
+                      : '1px solid var(--border-color)',
+                  }}
+                  initial={{ opacity: 0, y: 10, scale: 0.95 }}
+                  animate={{ opacity: 1, y: 0, scale: 1 }}
+                  transition={{
+                    duration: 0.15,
+                    delay: index * 0.02,
+                    type: 'spring',
+                    stiffness: 500,
+                    damping: 25,
+                  }}
+                  whileHover={{
+                    scale: 1.02,
+                    y: -2,
+                    borderColor: qr.hasWarning
+                      ? 'rgba(245, 158, 11, 0.8)'
+                      : 'var(--accent-blue)',
+                    boxShadow: '0 4px 12px rgba(37, 99, 235, 0.15)',
+                  }}
+                  whileTap={{ scale: 0.98 }}
+                >
+                  <div className="text-sm mb-3 qr-card-text">#{qr.id}</div>
+                  {renderScreenQr(qr, 120)}
+                  <div className="break-all qr-card-text qr-card-url">
+                    {shortUrlLabel(qr.url, 40)}
+                  </div>
+                </motion.div>
+              ))}
             </motion.div>
-          ))}
-        </motion.div>
-      </div>
-    </motion.div>
-  );
+          ) : (
+            selectedQr && (
+              <motion.div
+                className="flex flex-col lg:flex-row gap-6 lg:gap-8 lg:items-start"
+                initial={{ y: 10, opacity: 0 }}
+                animate={{ y: 0, opacity: 1 }}
+                transition={{ duration: 0.2, delay: 0.1 }}
+              >
+                <div className="flex-1 flex flex-col items-center text-center min-w-0">
+                  <div className="text-sm mb-3 qr-card-text">#{selectedQr.id}</div>
+                  <div
+                    className="rounded-lg p-6 w-full max-w-md mx-auto"
+                    style={{
+                      background: 'var(--card-background)',
+                      border: selectedQr.hasWarning
+                        ? '1px solid rgba(245, 158, 11, 0.5)'
+                        : '1px solid var(--border-color)',
+                    }}
+                  >
+                    {renderScreenQr(selectedQr, 220)}
+                    <div className="break-all qr-card-text qr-card-url mt-2 text-left">
+                      {shortUrlLabel(selectedQr.url, 200)}
+                    </div>
+                  </div>
+                </div>
+                <div className="w-full lg:w-80 shrink-0">
+                  <p
+                    className="text-sm font-medium mb-2"
+                    style={{ color: 'var(--secondary-text)' }}
+                  >
+                    All codes
+                  </p>
+                  <ul
+                    id="qr-codes-listbox"
+                    tabIndex={0}
+                    role="listbox"
+                    aria-label="All codes"
+                    aria-activedescendant={
+                      selectedQrId != null
+                        ? `qr-list-option-${selectedQrId}`
+                        : undefined
+                    }
+                    onKeyDown={handleCodesListKeyDown}
+                    className="qr-sidebar-list max-h-[min(60vh,28rem)] overflow-y-auto rounded-lg border space-y-1 p-1 outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent-blue)] focus-visible:ring-offset-2 focus-visible:ring-offset-[var(--card-background)]"
+                    style={{
+                      borderColor: 'var(--border-color)',
+                      background: 'var(--card-background)',
+                    }}
+                  >
+                    {qrCodes.map((qr) => {
+                      const isActive = qr.id === selectedQrId;
+                      return (
+                        <li key={qr.id} role="presentation">
+                          <button
+                            id={`qr-list-option-${qr.id}`}
+                            type="button"
+                            role="option"
+                            aria-selected={isActive}
+                            tabIndex={-1}
+                            onClick={() => setSelectedQrId(qr.id)}
+                            className="w-full text-left rounded-md px-3 py-2.5 text-sm transition-colors"
+                            style={{
+                              background: isActive
+                                ? 'rgba(37, 99, 235, 0.25)'
+                                : 'transparent',
+                              border: isActive
+                                ? '1px solid var(--accent-blue)'
+                                : '1px solid transparent',
+                              color: 'var(--foreground)',
+                            }}
+                          >
+                            <span className="qr-card-text font-medium">
+                              #{qr.id}
+                            </span>
+                            <span
+                              className="block truncate mt-0.5"
+                              style={{ color: 'var(--secondary-text)' }}
+                            >
+                              {shortUrlLabel(qr.url, 48)}
+                            </span>
+                          </button>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                </div>
+              </motion.div>
+            )
+          )}
+        </div>
+      </motion.div>
+    );
+  };
 
   return (
     <>
